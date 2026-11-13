@@ -32215,7 +32215,7 @@ const external_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta
  * Sanitizes an input into a string so it can be passed into issueCommand safely
  * @param input input to sanitize into a string
  */
-function utils_toCommandValue(input) {
+function toCommandValue(input) {
     if (input === null || input === undefined) {
         return '';
     }
@@ -32322,13 +32322,13 @@ class Command {
     }
 }
 function escapeData(s) {
-    return utils_toCommandValue(s)
+    return toCommandValue(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A');
 }
 function escapeProperty(s) {
-    return utils_toCommandValue(s)
+    return toCommandValue(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A')
@@ -32356,13 +32356,13 @@ function file_command_issueFileCommand(command, message) {
     if (!external_fs_namespaceObject.existsSync(filePath)) {
         throw new Error(`Missing file at path: ${filePath}`);
     }
-    external_fs_namespaceObject.appendFileSync(filePath, `${utils_toCommandValue(message)}${external_os_namespaceObject.EOL}`, {
+    external_fs_namespaceObject.appendFileSync(filePath, `${toCommandValue(message)}${external_os_namespaceObject.EOL}`, {
         encoding: 'utf8'
     });
 }
-function file_command_prepareKeyValueMessage(key, value) {
+function prepareKeyValueMessage(key, value) {
     const delimiter = `ghadelimiter_${external_crypto_namespaceObject.randomUUID()}`;
-    const convertedValue = utils_toCommandValue(value);
+    const convertedValue = toCommandValue(value);
     // These should realistically never happen, but just in case someone finds a
     // way to exploit uuid generation let's not allow keys or values that contain
     // the delimiter.
@@ -34879,9 +34879,9 @@ function exportVariable(name, val) {
     process.env[name] = convertedVal;
     const filePath = process.env['GITHUB_ENV'] || '';
     if (filePath) {
-        return issueFileCommand('ENV', prepareKeyValueMessage(name, val));
+        return file_command_issueFileCommand('ENV', prepareKeyValueMessage(name, val));
     }
-    issueCommand('set-env', { name }, convertedVal);
+    command_issueCommand('set-env', { name }, convertedVal);
 }
 /**
  * Registers a secret which will get masked from logs
@@ -34996,10 +34996,10 @@ function getBooleanInput(name, options) {
 function setOutput(name, value) {
     const filePath = process.env['GITHUB_OUTPUT'] || '';
     if (filePath) {
-        return file_command_issueFileCommand('OUTPUT', file_command_prepareKeyValueMessage(name, value));
+        return file_command_issueFileCommand('OUTPUT', prepareKeyValueMessage(name, value));
     }
     process.stdout.write(external_os_namespaceObject.EOL);
-    command_issueCommand('set-output', { name }, utils_toCommandValue(value));
+    command_issueCommand('set-output', { name }, toCommandValue(value));
 }
 /**
  * Enables or disables the echoing of commands into stdout for the rest of the step.
@@ -35118,9 +35118,9 @@ function group(name, fn) {
 function saveState(name, value) {
     const filePath = process.env['GITHUB_STATE'] || '';
     if (filePath) {
-        return file_command_issueFileCommand('STATE', file_command_prepareKeyValueMessage(name, value));
+        return file_command_issueFileCommand('STATE', prepareKeyValueMessage(name, value));
     }
-    command_issueCommand('save-state', { name }, utils_toCommandValue(value));
+    command_issueCommand('save-state', { name }, toCommandValue(value));
 }
 /**
  * Gets the value of an state set by this action's main execution.
@@ -43131,6 +43131,140 @@ async function getGitCommandManager(settings) {
     }
 }
 
+;// CONCATENATED MODULE: external "readline"
+const external_readline_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("readline");
+;// CONCATENATED MODULE: ./src/warpbuild/git-trace.ts
+/* eslint-disable i18n-text/no-en -- upstream conventions */
+
+
+
+
+
+
+// Native git tracing for every checkout. When the whole checkout exceeds the
+// threshold, the redacted traces are moved to OUTPUT_DIRECTORY under
+// RUNNER_TEMP and exported through the CHECKOUT_GIT_TRACE_* environment
+// variables so a later workflow step can upload them.
+const DEFAULT_THRESHOLD_SECONDS = 180;
+const OUTPUT_DIRECTORY = 'checkout-git-traces';
+const DIRECTORY_VARIABLE = 'CHECKOUT_GIT_TRACE_DIR';
+const ARTIFACT_VARIABLE = 'CHECKOUT_GIT_TRACE_ARTIFACT';
+const TRACE_FILES = {
+    GIT_TRACE: 'trace.log',
+    GIT_TRACE_PACKET: 'trace-packet.log',
+    GIT_TRACE_CURL: 'trace-curl.log',
+    GIT_TRACE2_PERF: 'trace2-perf.log',
+    GIT_TRACE2_EVENT: 'trace2-event.json'
+};
+function getThresholdSeconds() {
+    const input = getInput('git-trace-threshold-seconds');
+    if (!input) {
+        return DEFAULT_THRESHOLD_SECONDS;
+    }
+    const value = Number(input);
+    if (!Number.isFinite(value) || value < 0) {
+        throw new Error(`Invalid git-trace-threshold-seconds '${input}'. Expected a non-negative number.`);
+    }
+    return value;
+}
+function start(thresholdSeconds, now = Date.now) {
+    // Only describe the most recent checkout, so an upload step after a fast
+    // or untraced checkout does not re-upload an earlier checkout's traces.
+    if (process.env[ARTIFACT_VARIABLE]) {
+        exportVariable(ARTIFACT_VARIABLE, '');
+        exportVariable(DIRECTORY_VARIABLE, '');
+    }
+    const runnerTemp = process.env['RUNNER_TEMP'];
+    if (thresholdSeconds <= 0 || !runnerTemp) {
+        return undefined;
+    }
+    const directory = external_path_namespaceObject.join(runnerTemp, `checkout-git-trace-${external_crypto_namespaceObject.randomUUID()}`);
+    external_fs_namespaceObject.mkdirSync(directory, { recursive: true });
+    const setVariables = [];
+    const setIfUnset = (name, value) => {
+        if (process.env[name] === undefined) {
+            process.env[name] = value;
+            setVariables.push(name);
+        }
+    };
+    for (const [name, file] of Object.entries(TRACE_FILES)) {
+        setIfUnset(name, external_path_namespaceObject.join(directory, file));
+    }
+    setIfUnset('GIT_TRACE_CURL_NO_DATA', '1');
+    return { directory, thresholdSeconds, startedAt: now(), setVariables };
+}
+function artifactName(id) {
+    const job = (process.env['GITHUB_JOB'] || 'job').replace(/[^A-Za-z0-9_.-]/g, '-');
+    const attempt = process.env['GITHUB_RUN_ATTEMPT'] || '1';
+    return `checkout-git-trace-${job}-attempt-${attempt}-${id}`;
+}
+function redactor(secrets) {
+    const values = secrets
+        .filter(secret => secret.length >= 4)
+        .flatMap(secret => [
+        secret,
+        Buffer.from(`x-access-token:${secret}`, 'utf8').toString('base64')
+    ]);
+    return line => {
+        let result = line.replace(/(:\/\/[^/\s:@]+:)[^@\s/]+@/g, '$1***@');
+        for (const value of values) {
+            result = result.split(value).join('***');
+        }
+        return result;
+    };
+}
+async function copyRedacted(source, destination, redact) {
+    await (0,promises_namespaceObject.pipeline)(external_readline_namespaceObject.createInterface({
+        input: external_fs_namespaceObject.createReadStream(source),
+        crlfDelay: Infinity
+    }), async function* (lines) {
+        for await (const line of lines) {
+            yield `${redact(line)}\n`;
+        }
+    }, external_fs_namespaceObject.createWriteStream(destination));
+}
+async function finish(trace, secrets, now = Date.now) {
+    if (!trace) {
+        return;
+    }
+    for (const name of trace.setVariables) {
+        delete process.env[name];
+    }
+    const elapsedSeconds = (now() - trace.startedAt) / 1000;
+    try {
+        if (elapsedSeconds <= trace.thresholdSeconds) {
+            return;
+        }
+        const files = external_fs_namespaceObject.readdirSync(trace.directory)
+            .filter(file => external_fs_namespaceObject.statSync(external_path_namespaceObject.join(trace.directory, file)).isFile());
+        if (files.length === 0) {
+            warning(`Checkout took ${elapsedSeconds.toFixed(0)}s but no git trace files were written`);
+            return;
+        }
+        const id = external_crypto_namespaceObject.randomUUID().slice(0, 8);
+        const outputDirectory = external_path_namespaceObject.join(external_path_namespaceObject.dirname(trace.directory), OUTPUT_DIRECTORY, id);
+        external_fs_namespaceObject.mkdirSync(outputDirectory, { recursive: true });
+        const redact = redactor(secrets);
+        for (const file of files) {
+            await copyRedacted(external_path_namespaceObject.join(trace.directory, file), external_path_namespaceObject.join(outputDirectory, file), redact);
+        }
+        exportVariable(DIRECTORY_VARIABLE, outputDirectory);
+        exportVariable(ARTIFACT_VARIABLE, artifactName(id));
+        warning(`Checkout took ${elapsedSeconds.toFixed(0)}s (threshold ${trace.thresholdSeconds}s); git traces written to ${outputDirectory}`);
+    }
+    catch (error) {
+        warning(`Failed to save git traces: ${error instanceof Error ? error.message : error}`);
+    }
+    finally {
+        try {
+            external_fs_namespaceObject.rmSync(trace.directory, { recursive: true, force: true });
+        }
+        catch (error) {
+            warning(`Failed to remove ${trace.directory}: ${error instanceof Error ? error.message : error}`);
+        }
+    }
+}
+
 ;// CONCATENATED MODULE: ./src/unsafe-pr-checkout-helper.ts
 
 
@@ -43398,10 +43532,12 @@ async function getInputs() {
 
 
 
+
 const main_dirname = external_path_namespaceObject.dirname((0,external_url_namespaceObject.fileURLToPath)(import.meta.url));
 async function run() {
     try {
         const sourceSettings = await getInputs();
+        const trace = start(getThresholdSeconds());
         try {
             // Register problem matcher
             info(`::add-matcher::${external_path_namespaceObject.join(main_dirname, 'problem-matcher.json')}`);
@@ -43412,6 +43548,7 @@ async function run() {
         finally {
             // Unregister problem matcher
             info('::remove-matcher owner=checkout-git::');
+            await finish(trace, [sourceSettings.authToken]);
         }
     }
     catch (error) {

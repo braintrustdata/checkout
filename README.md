@@ -20,7 +20,26 @@ checkout shape:
   the checkout was seeded from the mirror). Behavior is identical to upstream everywhere
   except WarpBuild runners.
 - Fail-open — any cache error degrades to stock `actions/checkout` behavior.
+- Traces git (`GIT_TRACE`, `GIT_TRACE_PACKET`, `GIT_TRACE_CURL` without data, `GIT_TRACE2_PERF`,
+  `GIT_TRACE2_EVENT`) to files under `RUNNER_TEMP`. When the checkout takes longer than
+  `git-trace-threshold-seconds` (default `180`; `0` disables), the traces are redacted, moved to
+  `$RUNNER_TEMP/checkout-git-traces/<id>`, and exported as `CHECKOUT_GIT_TRACE_DIR` with a
+  unique artifact name in `CHECKOUT_GIT_TRACE_ARTIFACT`; otherwise they are deleted. Trace
+  variables already set by the workflow are left alone, and tracing errors only warn.
 - All fork code lives in `src/warpbuild/`.
+
+## Upload traces from slow checkouts
+
+```yaml
+- uses: braintrustdata/checkout@<sha>
+- if: always() && env.CHECKOUT_GIT_TRACE_ARTIFACT
+  uses: actions/upload-artifact@v7
+  with:
+    name: ${{ env.CHECKOUT_GIT_TRACE_ARTIFACT }}
+    path: ${{ env.CHECKOUT_GIT_TRACE_DIR }}
+    retention-days: 7
+    overwrite: true
+```
 
 ## Upload the cache only on main
 
@@ -173,6 +192,13 @@ Please refer to the [release page](https://github.com/WarpBuilds/checkout/releas
     # Set to false to restore from the cache without updating it.
     # Default: true
     cache-upload: ''
+
+    # Trace git commands and, when the checkout takes longer than this many seconds,
+    # save the redacted traces under RUNNER_TEMP and export their location in
+    # CHECKOUT_GIT_TRACE_DIR and an artifact name in CHECKOUT_GIT_TRACE_ARTIFACT. Set
+    # to 0 to disable tracing.
+    # Default: 180
+    git-trace-threshold-seconds: ''
 
     # Number of commits to fetch. 0 indicates all history for all branches and tags.
     # Default: 1

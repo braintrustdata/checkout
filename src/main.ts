@@ -1,5 +1,6 @@
 import * as core from '@actions/core'
 import * as gitSourceProvider from './git-source-provider.js'
+import * as gitTrace from './warpbuild/git-trace.js'
 import * as inputHelper from './input-helper.js'
 import * as path from 'path'
 import * as stateHelper from './state-helper.js'
@@ -10,6 +11,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 async function run(): Promise<void> {
   try {
     const sourceSettings = await inputHelper.getInputs()
+    const trace = gitTrace.start(gitTrace.getThresholdSeconds())
 
     try {
       // Register problem matcher
@@ -23,6 +25,7 @@ async function run(): Promise<void> {
     } finally {
       // Unregister problem matcher
       core.info('::remove-matcher owner=checkout-git::')
+      await gitTrace.finish(trace, [sourceSettings.authToken])
     }
   } catch (error) {
     core.setFailed(`${(error as any)?.message ?? error}`)
