@@ -76,6 +76,12 @@ inputs:
       Whether to upload WarpBuild mirror cache snapshots and bundles after checkout.
       Set to false to restore from the cache without updating it.
     default: true
+  git-trace-threshold-seconds:
+    description: >
+      Trace git commands to files under RUNNER_TEMP and upload them as an
+      artifact when the checkout takes longer than this many seconds. Set to 0
+      to disable tracing.
+    default: 180
   fetch-depth:
     description: 'Number of commits to fetch. 0 indicates all history for all branches and tags.'
     default: 1
