@@ -43140,6 +43140,7 @@ const external_readline_namespaceObject = __WEBPACK_EXTERNAL_createRequire(impor
 
 
 
+
 // Native git tracing for every checkout. When the whole checkout exceeds the
 // threshold, the redacted traces are moved to OUTPUT_DIRECTORY under
 // RUNNER_TEMP and exported through the CHECKOUT_GIT_TRACE_* environment
@@ -43167,15 +43168,15 @@ function getThresholdSeconds() {
     return value;
 }
 function start(thresholdSeconds, now = Date.now) {
-    const runnerTemp = process.env['RUNNER_TEMP'];
-    if (thresholdSeconds <= 0 || !runnerTemp) {
-        return undefined;
-    }
     // Only describe the most recent checkout, so an upload step after a fast
-    // checkout does not re-upload an earlier checkout's traces.
+    // or untraced checkout does not re-upload an earlier checkout's traces.
     if (process.env[ARTIFACT_VARIABLE]) {
         exportVariable(ARTIFACT_VARIABLE, '');
         exportVariable(DIRECTORY_VARIABLE, '');
+    }
+    const runnerTemp = process.env['RUNNER_TEMP'];
+    if (thresholdSeconds <= 0 || !runnerTemp) {
+        return undefined;
     }
     const directory = external_path_namespaceObject.join(runnerTemp, `checkout-git-trace-${external_crypto_namespaceObject.randomUUID()}`);
     external_fs_namespaceObject.mkdirSync(directory, { recursive: true });
@@ -43213,20 +43214,14 @@ function redactor(secrets) {
     };
 }
 async function copyRedacted(source, destination, redact) {
-    const output = external_fs_namespaceObject.createWriteStream(destination);
-    const lines = external_readline_namespaceObject.createInterface({
+    await (0,promises_namespaceObject.pipeline)(external_readline_namespaceObject.createInterface({
         input: external_fs_namespaceObject.createReadStream(source),
         crlfDelay: Infinity
-    });
-    for await (const line of lines) {
-        if (!output.write(`${redact(line)}\n`)) {
-            await new Promise(resolve => output.once('drain', () => resolve()));
+    }), async function* (lines) {
+        for await (const line of lines) {
+            yield `${redact(line)}\n`;
         }
-    }
-    await new Promise((resolve, reject) => {
-        output.on('error', reject);
-        output.end(resolve);
-    });
+    }, external_fs_namespaceObject.createWriteStream(destination));
 }
 async function finish(trace, secrets, now = Date.now) {
     if (!trace) {

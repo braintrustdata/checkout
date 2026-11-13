@@ -131,13 +131,16 @@ describe('git-trace', () => {
     expect(fs.existsSync(trace?.directory as string)).toBe(false)
   })
 
-  it('clears traces exported by an earlier checkout', () => {
-    process.env[ARTIFACT_VARIABLE] = 'previous'
-    process.env[DIRECTORY_VARIABLE] = '/previous'
-    start(180)
-    expect(process.env[ARTIFACT_VARIABLE]).toBe('')
-    expect(process.env[DIRECTORY_VARIABLE]).toBe('')
-  })
+  it.each([180, 0])(
+    'clears traces exported by an earlier checkout (threshold %d)',
+    threshold => {
+      process.env[ARTIFACT_VARIABLE] = 'previous'
+      process.env[DIRECTORY_VARIABLE] = '/previous'
+      start(threshold)
+      expect(process.env[ARTIFACT_VARIABLE]).toBe('')
+      expect(process.env[DIRECTORY_VARIABLE]).toBe('')
+    }
+  )
 
   it('keeps trace variables set by the workflow', async () => {
     process.env['GIT_TRACE'] = '1'

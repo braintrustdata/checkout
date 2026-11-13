@@ -4,6 +4,7 @@ import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as readline from 'readline'
+import {pipeline} from 'stream/promises'
 
 // Native git tracing for every checkout. When the whole checkout exceeds the
 // threshold, the redacted traces are moved to OUTPUT_DIRECTORY under
@@ -48,16 +49,16 @@ export function start(
   thresholdSeconds: number,
   now: () => number = Date.now
 ): GitTrace | undefined {
-  const runnerTemp = process.env['RUNNER_TEMP']
-  if (thresholdSeconds <= 0 || !runnerTemp) {
-    return undefined
-  }
-
   // Only describe the most recent checkout, so an upload step after a fast
-  // checkout does not re-upload an earlier checkout's traces.
+  // or untraced checkout does not re-upload an earlier checkout's traces.
   if (process.env[ARTIFACT_VARIABLE]) {
     core.exportVariable(ARTIFACT_VARIABLE, '')
     core.exportVariable(DIRECTORY_VARIABLE, '')
+  }
+
+  const runnerTemp = process.env['RUNNER_TEMP']
+  if (thresholdSeconds <= 0 || !runnerTemp) {
+    return undefined
   }
 
   const directory = path.join(
@@ -111,20 +112,18 @@ async function copyRedacted(
   destination: string,
   redact: (line: string) => string
 ): Promise<void> {
-  const output = fs.createWriteStream(destination)
-  const lines = readline.createInterface({
-    input: fs.createReadStream(source),
-    crlfDelay: Infinity
-  })
-  for await (const line of lines) {
-    if (!output.write(`${redact(line)}\n`)) {
-      await new Promise<void>(resolve => output.once('drain', () => resolve()))
-    }
-  }
-  await new Promise<void>((resolve, reject) => {
-    output.on('error', reject)
-    output.end(resolve)
-  })
+  await pipeline(
+    readline.createInterface({
+      input: fs.createReadStream(source),
+      crlfDelay: Infinity
+    }),
+    async function* (lines: AsyncIterable<string>) {
+      for await (const line of lines) {
+        yield `${redact(line)}\n`
+      }
+    },
+    fs.createWriteStream(destination)
+  )
 }
 
 export async function finish(
