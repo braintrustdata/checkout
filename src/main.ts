@@ -25,7 +25,7 @@ async function run(): Promise<void> {
     } finally {
       // Unregister problem matcher
       core.info('::remove-matcher owner=checkout-git::')
-      await gitTrace.finish(trace)
+      await gitTrace.finish(trace, [sourceSettings.authToken])
     }
   } catch (error) {
     core.setFailed(`${(error as any)?.message ?? error}`)

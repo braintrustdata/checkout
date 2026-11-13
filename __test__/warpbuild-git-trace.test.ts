@@ -3,9 +3,11 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
-  ArtifactUploader,
+  ARTIFACT_VARIABLE,
+  DIRECTORY_VARIABLE,
   finish,
   getThresholdSeconds,
+  redactor,
   start
 } from '../src/warpbuild/git-trace.js'
 
@@ -22,15 +24,12 @@ const managedVariables = [
   'RUNNER_TEMP',
   'GITHUB_JOB',
   'GITHUB_RUN_ATTEMPT',
+  'GITHUB_ENV',
+  ARTIFACT_VARIABLE,
+  DIRECTORY_VARIABLE,
   'INPUT_GIT-TRACE-THRESHOLD-SECONDS'
 ]
 const savedEnv = new Map(managedVariables.map(key => [key, process.env[key]]))
-
-function uploaderMock() {
-  const uploadArtifact = jest.fn<ArtifactUploader['uploadArtifact']>()
-  uploadArtifact.mockResolvedValue({id: 1, size: 2})
-  return {uploader: {uploadArtifact}, uploadArtifact}
-}
 
 describe('git-trace', () => {
   let runnerTemp: string
@@ -43,6 +42,8 @@ describe('git-trace', () => {
     process.env['RUNNER_TEMP'] = runnerTemp
     process.env['GITHUB_JOB'] = 'frontend verify'
     process.env['GITHUB_RUN_ATTEMPT'] = '2'
+    process.env['GITHUB_ENV'] = path.join(runnerTemp, 'github-env')
+    fs.writeFileSync(process.env['GITHUB_ENV'], '')
   })
 
   afterEach(() => {
@@ -69,7 +70,7 @@ describe('git-trace', () => {
     expect(process.env['GIT_TRACE']).toBeUndefined()
   })
 
-  it('uploads traces when the checkout is slow', async () => {
+  it('saves redacted traces when the checkout is slow', async () => {
     let clock = 1_000
     const trace = start(180, () => clock)
     expect(trace).toBeDefined()
@@ -77,24 +78,38 @@ describe('git-trace', () => {
     expect(path.dirname(process.env['GIT_TRACE2_EVENT'] as string)).toBe(
       trace?.directory
     )
-    fs.writeFileSync(process.env['GIT_TRACE'] as string, 'trace')
-    fs.writeFileSync(process.env['GIT_TRACE2_EVENT'] as string, '{}')
+    const basic = Buffer.from('x-access-token:ghs_secret').toString('base64')
+    fs.writeFileSync(
+      process.env['GIT_TRACE'] as string,
+      `git config extraheader 'AUTHORIZATION: basic ${basic}'\ngit fetch https://user:ghs_secret@example.com/repo\n`
+    )
+    fs.writeFileSync(process.env['GIT_TRACE2_EVENT'] as string, '{}\n')
 
     clock += 181_000
-    const {uploader, uploadArtifact} = uploaderMock()
-    await finish(trace, uploader, () => clock)
+    await finish(trace, ['ghs_secret'], () => clock)
 
-    expect(uploadArtifact).toHaveBeenCalledTimes(1)
-    const [name, files, root, options] = uploadArtifact.mock.calls[0]
-    expect(name).toMatch(
-      /^checkout-git-trace-frontend-verify-attempt-2-[0-9a-f]{8}$/
+    const outputDirectory = process.env[DIRECTORY_VARIABLE] as string
+    expect(path.dirname(outputDirectory)).toBe(
+      path.join(runnerTemp, 'checkout-git-traces')
     )
-    expect(files.map(file => path.basename(file)).sort()).toEqual([
+    expect(process.env[ARTIFACT_VARIABLE]).toBe(
+      `checkout-git-trace-frontend-verify-attempt-2-${path.basename(outputDirectory)}`
+    )
+    expect(fs.readdirSync(outputDirectory).sort()).toEqual([
       'trace.log',
       'trace2-event.json'
     ])
-    expect(root).toBe(trace?.directory)
-    expect(options).toEqual({retentionDays: 7})
+    expect(
+      fs.readFileSync(path.join(outputDirectory, 'trace.log'), 'utf8')
+    ).toBe(
+      "git config extraheader 'AUTHORIZATION: basic ***'\ngit fetch https://user:***@example.com/repo\n"
+    )
+    const githubEnv = fs.readFileSync(
+      process.env['GITHUB_ENV'] as string,
+      'utf8'
+    )
+    expect(githubEnv).toContain(ARTIFACT_VARIABLE)
+    expect(githubEnv).toContain(outputDirectory)
     for (const key of traceVariables) {
       expect(process.env[key]).toBeUndefined()
     }
@@ -107,28 +122,43 @@ describe('git-trace', () => {
     fs.writeFileSync(process.env['GIT_TRACE'] as string, 'trace')
 
     clock += 180_000
-    const {uploader, uploadArtifact} = uploaderMock()
-    await finish(trace, uploader, () => clock)
+    await finish(trace, [], () => clock)
 
-    expect(uploadArtifact).not.toHaveBeenCalled()
+    expect(process.env[ARTIFACT_VARIABLE]).toBeUndefined()
+    expect(fs.existsSync(path.join(runnerTemp, 'checkout-git-traces'))).toBe(
+      false
+    )
     expect(fs.existsSync(trace?.directory as string)).toBe(false)
+  })
+
+  it('clears traces exported by an earlier checkout', () => {
+    process.env[ARTIFACT_VARIABLE] = 'previous'
+    process.env[DIRECTORY_VARIABLE] = '/previous'
+    start(180)
+    expect(process.env[ARTIFACT_VARIABLE]).toBe('')
+    expect(process.env[DIRECTORY_VARIABLE]).toBe('')
   })
 
   it('keeps trace variables set by the workflow', async () => {
     process.env['GIT_TRACE'] = '1'
     const trace = start(180)
     expect(process.env['GIT_TRACE']).toBe('1')
-    await finish(trace, uploaderMock().uploader)
+    await finish(trace, [])
     expect(process.env['GIT_TRACE']).toBe('1')
   })
 
-  it('does not fail the checkout when the upload fails', async () => {
+  it('does not fail the checkout when saving traces fails', async () => {
     let clock = 1_000
     const trace = start(1, () => clock)
     fs.writeFileSync(process.env['GIT_TRACE'] as string, 'trace')
+    fs.writeFileSync(path.join(runnerTemp, 'checkout-git-traces'), '')
     clock += 2_000
-    const {uploader, uploadArtifact} = uploaderMock()
-    uploadArtifact.mockRejectedValue(new Error('no runtime token'))
-    await expect(finish(trace, uploader, () => clock)).resolves.toBeUndefined()
+    await expect(finish(trace, [], () => clock)).resolves.toBeUndefined()
+    expect(process.env[ARTIFACT_VARIABLE]).toBeUndefined()
+    expect(fs.existsSync(trace?.directory as string)).toBe(false)
+  })
+
+  it('ignores short secrets', () => {
+    expect(redactor(['', 'abc'])('abc')).toBe('abc')
   })
 })

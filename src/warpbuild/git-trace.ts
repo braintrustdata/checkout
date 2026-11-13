@@ -1,16 +1,19 @@
 /* eslint-disable i18n-text/no-en -- upstream conventions */
-import {DefaultArtifactClient} from '@actions/artifact'
 import * as core from '@actions/core'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
+import * as readline from 'readline'
 
-// Native git tracing for every checkout. The trace files are uploaded as an
-// artifact only when the whole checkout exceeds the threshold, so slow
-// fetches can be diagnosed after the fact without keeping traces for fast runs.
+// Native git tracing for every checkout. When the whole checkout exceeds the
+// threshold, the redacted traces are moved to OUTPUT_DIRECTORY under
+// RUNNER_TEMP and exported through the CHECKOUT_GIT_TRACE_* environment
+// variables so a later workflow step can upload them.
 
 const DEFAULT_THRESHOLD_SECONDS = 180
-const RETENTION_DAYS = 7
+export const OUTPUT_DIRECTORY = 'checkout-git-traces'
+export const DIRECTORY_VARIABLE = 'CHECKOUT_GIT_TRACE_DIR'
+export const ARTIFACT_VARIABLE = 'CHECKOUT_GIT_TRACE_ARTIFACT'
 
 const TRACE_FILES: Record<string, string> = {
   GIT_TRACE: 'trace.log',
@@ -25,15 +28,6 @@ export interface GitTrace {
   thresholdSeconds: number
   startedAt: number
   setVariables: string[]
-}
-
-export interface ArtifactUploader {
-  uploadArtifact(
-    name: string,
-    files: string[],
-    rootDirectory: string,
-    options: {retentionDays: number}
-  ): Promise<{id?: number; size?: number}>
 }
 
 export function getThresholdSeconds(): number {
@@ -59,6 +53,13 @@ export function start(
     return undefined
   }
 
+  // Only describe the most recent checkout, so an upload step after a fast
+  // checkout does not re-upload an earlier checkout's traces.
+  if (process.env[ARTIFACT_VARIABLE]) {
+    core.exportVariable(ARTIFACT_VARIABLE, '')
+    core.exportVariable(DIRECTORY_VARIABLE, '')
+  }
+
   const directory = path.join(
     runnerTemp,
     `checkout-git-trace-${crypto.randomUUID()}`
@@ -80,20 +81,55 @@ export function start(
   return {directory, thresholdSeconds, startedAt: now(), setVariables}
 }
 
-export function artifactName(): string {
+function artifactName(id: string): string {
   const job = (process.env['GITHUB_JOB'] || 'job').replace(
     /[^A-Za-z0-9_.-]/g,
     '-'
   )
   const attempt = process.env['GITHUB_RUN_ATTEMPT'] || '1'
-  return `checkout-git-trace-${job}-attempt-${attempt}-${crypto
-    .randomUUID()
-    .slice(0, 8)}`
+  return `checkout-git-trace-${job}-attempt-${attempt}-${id}`
+}
+
+export function redactor(secrets: string[]): (line: string) => string {
+  const values = secrets
+    .filter(secret => secret.length >= 4)
+    .flatMap(secret => [
+      secret,
+      Buffer.from(`x-access-token:${secret}`, 'utf8').toString('base64')
+    ])
+  return line => {
+    let result = line.replace(/(:\/\/[^/\s:@]+:)[^@\s/]+@/g, '$1***@')
+    for (const value of values) {
+      result = result.split(value).join('***')
+    }
+    return result
+  }
+}
+
+async function copyRedacted(
+  source: string,
+  destination: string,
+  redact: (line: string) => string
+): Promise<void> {
+  const output = fs.createWriteStream(destination)
+  const lines = readline.createInterface({
+    input: fs.createReadStream(source),
+    crlfDelay: Infinity
+  })
+  for await (const line of lines) {
+    if (!output.write(`${redact(line)}\n`)) {
+      await new Promise<void>(resolve => output.once('drain', () => resolve()))
+    }
+  }
+  await new Promise<void>((resolve, reject) => {
+    output.on('error', reject)
+    output.end(resolve)
+  })
 }
 
 export async function finish(
   trace: GitTrace | undefined,
-  uploader: ArtifactUploader = new DefaultArtifactClient(),
+  secrets: string[],
   now: () => number = Date.now
 ): Promise<void> {
   if (!trace) {
@@ -111,8 +147,7 @@ export async function finish(
 
     const files = fs
       .readdirSync(trace.directory)
-      .map(file => path.join(trace.directory, file))
-      .filter(file => fs.statSync(file).isFile())
+      .filter(file => fs.statSync(path.join(trace.directory, file)).isFile())
     if (files.length === 0) {
       core.warning(
         `Checkout took ${elapsedSeconds.toFixed(0)}s but no git trace files were written`
@@ -120,21 +155,38 @@ export async function finish(
       return
     }
 
-    const name = artifactName()
-    core.warning(
-      `Checkout took ${elapsedSeconds.toFixed(0)}s (threshold ${trace.thresholdSeconds}s); uploading git trace artifact '${name}'`
+    const id = crypto.randomUUID().slice(0, 8)
+    const outputDirectory = path.join(
+      path.dirname(trace.directory),
+      OUTPUT_DIRECTORY,
+      id
     )
-    const result = await uploader.uploadArtifact(name, files, trace.directory, {
-      retentionDays: RETENTION_DAYS
-    })
-    core.info(
-      `Uploaded git trace artifact '${name}' (id ${result.id}, ${result.size} bytes)`
+    fs.mkdirSync(outputDirectory, {recursive: true})
+    const redact = redactor(secrets)
+    for (const file of files) {
+      await copyRedacted(
+        path.join(trace.directory, file),
+        path.join(outputDirectory, file),
+        redact
+      )
+    }
+
+    core.exportVariable(DIRECTORY_VARIABLE, outputDirectory)
+    core.exportVariable(ARTIFACT_VARIABLE, artifactName(id))
+    core.warning(
+      `Checkout took ${elapsedSeconds.toFixed(0)}s (threshold ${trace.thresholdSeconds}s); git traces written to ${outputDirectory}`
     )
   } catch (error) {
     core.warning(
-      `Failed to upload git trace artifact: ${error instanceof Error ? error.message : error}`
+      `Failed to save git traces: ${error instanceof Error ? error.message : error}`
     )
   } finally {
-    fs.rmSync(trace.directory, {recursive: true, force: true})
+    try {
+      fs.rmSync(trace.directory, {recursive: true, force: true})
+    } catch (error) {
+      core.warning(
+        `Failed to remove ${trace.directory}: ${error instanceof Error ? error.message : error}`
+      )
+    }
   }
 }

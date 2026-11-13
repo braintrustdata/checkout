@@ -78,9 +78,10 @@ inputs:
     default: true
   git-trace-threshold-seconds:
     description: >
-      Trace git commands to files under RUNNER_TEMP and upload them as an
-      artifact when the checkout takes longer than this many seconds. Set to 0
-      to disable tracing.
+      Trace git commands and, when the checkout takes longer than this many
+      seconds, save the redacted traces under RUNNER_TEMP and export their
+      location in CHECKOUT_GIT_TRACE_DIR and an artifact name in
+      CHECKOUT_GIT_TRACE_ARTIFACT. Set to 0 to disable tracing.
     default: 180
   fetch-depth:
     description: 'Number of commits to fetch. 0 indicates all history for all branches and tags.'
