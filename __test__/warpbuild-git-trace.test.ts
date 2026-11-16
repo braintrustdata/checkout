@@ -4,9 +4,13 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {
   ARTIFACT_VARIABLE,
+  ATTEMPTS_FILE,
   DIRECTORY_VARIABLE,
+  clearExports,
   finish,
   getThresholdSeconds,
+  newOutput,
+  publish,
   redactor,
   start
 } from '../src/warpbuild/git-trace.js'
@@ -86,30 +90,18 @@ describe('git-trace', () => {
     fs.writeFileSync(process.env['GIT_TRACE2_EVENT'] as string, '{}\n')
 
     clock += 181_000
-    await finish(trace, ['ghs_secret'], () => clock)
+    const destination = path.join(runnerTemp, 'out', 'attempt-1')
+    await expect(
+      finish(trace, ['ghs_secret'], destination, () => clock)
+    ).resolves.toBe(true)
 
-    const outputDirectory = process.env[DIRECTORY_VARIABLE] as string
-    expect(path.dirname(outputDirectory)).toBe(
-      path.join(runnerTemp, 'checkout-git-traces')
-    )
-    expect(process.env[ARTIFACT_VARIABLE]).toBe(
-      `checkout-git-trace-frontend-verify-attempt-2-${path.basename(outputDirectory)}`
-    )
-    expect(fs.readdirSync(outputDirectory).sort()).toEqual([
+    expect(fs.readdirSync(destination).sort()).toEqual([
       'trace.log',
       'trace2-event.json'
     ])
-    expect(
-      fs.readFileSync(path.join(outputDirectory, 'trace.log'), 'utf8')
-    ).toBe(
+    expect(fs.readFileSync(path.join(destination, 'trace.log'), 'utf8')).toBe(
       "git config extraheader 'AUTHORIZATION: basic ***'\ngit fetch https://user:***@example.com/repo\n"
     )
-    const githubEnv = fs.readFileSync(
-      process.env['GITHUB_ENV'] as string,
-      'utf8'
-    )
-    expect(githubEnv).toContain(ARTIFACT_VARIABLE)
-    expect(githubEnv).toContain(outputDirectory)
     for (const key of traceVariables) {
       expect(process.env[key]).toBeUndefined()
     }
@@ -122,31 +114,56 @@ describe('git-trace', () => {
     fs.writeFileSync(process.env['GIT_TRACE'] as string, 'trace')
 
     clock += 180_000
-    await finish(trace, [], () => clock)
-
-    expect(process.env[ARTIFACT_VARIABLE]).toBeUndefined()
-    expect(fs.existsSync(path.join(runnerTemp, 'checkout-git-traces'))).toBe(
+    const destination = path.join(runnerTemp, 'out', 'attempt-1')
+    await expect(finish(trace, [], destination, () => clock)).resolves.toBe(
       false
     )
+
+    expect(fs.existsSync(destination)).toBe(false)
     expect(fs.existsSync(trace?.directory as string)).toBe(false)
   })
 
-  it.each([180, 0])(
-    'clears traces exported by an earlier checkout (threshold %d)',
-    threshold => {
-      process.env[ARTIFACT_VARIABLE] = 'previous'
-      process.env[DIRECTORY_VARIABLE] = '/previous'
-      start(threshold)
-      expect(process.env[ARTIFACT_VARIABLE]).toBe('')
-      expect(process.env[DIRECTORY_VARIABLE]).toBe('')
-    }
-  )
+  it('exports the traces of a checkout with a slow attempt', () => {
+    const output = newOutput()
+    expect(output?.directory).toBe(
+      path.join(runnerTemp, 'checkout-git-traces', output?.id as string)
+    )
+    fs.mkdirSync(output?.directory as string, {recursive: true})
+    publish(output!, {attempts: []})
+
+    expect(process.env[DIRECTORY_VARIABLE]).toBe(output?.directory)
+    expect(process.env[ARTIFACT_VARIABLE]).toBe(
+      `checkout-git-trace-frontend-verify-attempt-2-${output?.id}`
+    )
+    expect(
+      JSON.parse(
+        fs.readFileSync(
+          path.join(output?.directory as string, ATTEMPTS_FILE),
+          'utf8'
+        )
+      )
+    ).toEqual({attempts: []})
+    const githubEnv = fs.readFileSync(
+      process.env['GITHUB_ENV'] as string,
+      'utf8'
+    )
+    expect(githubEnv).toContain(ARTIFACT_VARIABLE)
+    expect(githubEnv).toContain(output?.directory)
+  })
+
+  it('clears traces exported by an earlier checkout', () => {
+    process.env[ARTIFACT_VARIABLE] = 'previous'
+    process.env[DIRECTORY_VARIABLE] = '/previous'
+    clearExports()
+    expect(process.env[ARTIFACT_VARIABLE]).toBe('')
+    expect(process.env[DIRECTORY_VARIABLE]).toBe('')
+  })
 
   it('keeps trace variables set by the workflow', async () => {
     process.env['GIT_TRACE'] = '1'
     const trace = start(180)
     expect(process.env['GIT_TRACE']).toBe('1')
-    await finish(trace, [])
+    await finish(trace, [], path.join(runnerTemp, 'out'))
     expect(process.env['GIT_TRACE']).toBe('1')
   })
 
@@ -154,10 +171,11 @@ describe('git-trace', () => {
     let clock = 1_000
     const trace = start(1, () => clock)
     fs.writeFileSync(process.env['GIT_TRACE'] as string, 'trace')
-    fs.writeFileSync(path.join(runnerTemp, 'checkout-git-traces'), '')
+    fs.writeFileSync(path.join(runnerTemp, 'out'), '')
     clock += 2_000
-    await expect(finish(trace, [], () => clock)).resolves.toBeUndefined()
-    expect(process.env[ARTIFACT_VARIABLE]).toBeUndefined()
+    await expect(
+      finish(trace, [], path.join(runnerTemp, 'out', 'attempt-1'), () => clock)
+    ).resolves.toBe(false)
     expect(fs.existsSync(trace?.directory as string)).toBe(false)
   })
 

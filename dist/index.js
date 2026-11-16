@@ -35153,6 +35153,294 @@ function getIDToken(aud) {
  */
 
 //# sourceMappingURL=core.js.map
+;// CONCATENATED MODULE: external "readline"
+const external_readline_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("readline");
+;// CONCATENATED MODULE: external "stream/promises"
+const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("stream/promises");
+;// CONCATENATED MODULE: ./src/warpbuild/git-trace.ts
+/* eslint-disable i18n-text/no-en -- upstream conventions */
+
+
+
+
+
+
+// Native git tracing for every checkout attempt. When an attempt exceeds the
+// threshold, its redacted traces are moved to an attempt-<n> directory under
+// OUTPUT_DIRECTORY in RUNNER_TEMP, and the directory is exported through the
+// CHECKOUT_GIT_TRACE_* environment variables so a later workflow step can
+// upload it.
+const DEFAULT_THRESHOLD_SECONDS = 180;
+const OUTPUT_DIRECTORY = 'checkout-git-traces';
+const DIRECTORY_VARIABLE = 'CHECKOUT_GIT_TRACE_DIR';
+const ARTIFACT_VARIABLE = 'CHECKOUT_GIT_TRACE_ARTIFACT';
+const ATTEMPTS_FILE = 'attempts.json';
+const TRACE_FILES = {
+    GIT_TRACE: 'trace.log',
+    GIT_TRACE_PACKET: 'trace-packet.log',
+    GIT_TRACE_CURL: 'trace-curl.log',
+    GIT_TRACE2_PERF: 'trace2-perf.log',
+    GIT_TRACE2_EVENT: 'trace2-event.json'
+};
+function getThresholdSeconds() {
+    const input = getInput('git-trace-threshold-seconds');
+    if (!input) {
+        return DEFAULT_THRESHOLD_SECONDS;
+    }
+    const value = Number(input);
+    if (!Number.isFinite(value) || value < 0) {
+        throw new Error(`Invalid git-trace-threshold-seconds '${input}'. Expected a non-negative number.`);
+    }
+    return value;
+}
+// Only describe the most recent checkout, so an upload step after a fast or
+// untraced checkout does not re-upload an earlier checkout's traces.
+function clearExports() {
+    if (process.env[ARTIFACT_VARIABLE]) {
+        exportVariable(ARTIFACT_VARIABLE, '');
+        exportVariable(DIRECTORY_VARIABLE, '');
+    }
+}
+function newOutput() {
+    const runnerTemp = process.env['RUNNER_TEMP'];
+    if (!runnerTemp) {
+        return undefined;
+    }
+    const id = external_crypto_namespaceObject.randomUUID().slice(0, 8);
+    return { id, directory: external_path_namespaceObject.join(runnerTemp, OUTPUT_DIRECTORY, id) };
+}
+function start(thresholdSeconds, now = Date.now) {
+    const runnerTemp = process.env['RUNNER_TEMP'];
+    if (thresholdSeconds <= 0 || !runnerTemp) {
+        return undefined;
+    }
+    const directory = external_path_namespaceObject.join(runnerTemp, `checkout-git-trace-${external_crypto_namespaceObject.randomUUID()}`);
+    external_fs_namespaceObject.mkdirSync(directory, { recursive: true });
+    const setVariables = [];
+    const setIfUnset = (name, value) => {
+        if (process.env[name] === undefined) {
+            process.env[name] = value;
+            setVariables.push(name);
+        }
+    };
+    for (const [name, file] of Object.entries(TRACE_FILES)) {
+        setIfUnset(name, external_path_namespaceObject.join(directory, file));
+    }
+    setIfUnset('GIT_TRACE_CURL_NO_DATA', '1');
+    return { directory, thresholdSeconds, startedAt: now(), setVariables };
+}
+function artifactName(id) {
+    const job = (process.env['GITHUB_JOB'] || 'job').replace(/[^A-Za-z0-9_.-]/g, '-');
+    const attempt = process.env['GITHUB_RUN_ATTEMPT'] || '1';
+    return `checkout-git-trace-${job}-attempt-${attempt}-${id}`;
+}
+function redactor(secrets) {
+    const values = secrets
+        .filter(secret => secret.length >= 4)
+        .flatMap(secret => [
+        secret,
+        Buffer.from(`x-access-token:${secret}`, 'utf8').toString('base64')
+    ]);
+    return line => {
+        let result = line.replace(/(:\/\/[^/\s:@]+:)[^@\s/]+@/g, '$1***@');
+        for (const value of values) {
+            result = result.split(value).join('***');
+        }
+        return result;
+    };
+}
+async function copyRedacted(source, destination, redact) {
+    await (0,promises_namespaceObject.pipeline)(external_readline_namespaceObject.createInterface({
+        input: external_fs_namespaceObject.createReadStream(source),
+        crlfDelay: Infinity
+    }), async function* (lines) {
+        for await (const line of lines) {
+            yield `${redact(line)}\n`;
+        }
+    }, external_fs_namespaceObject.createWriteStream(destination));
+}
+async function finish(trace, secrets, destination, now = Date.now) {
+    if (!trace) {
+        return false;
+    }
+    for (const name of trace.setVariables) {
+        delete process.env[name];
+    }
+    const elapsedSeconds = (now() - trace.startedAt) / 1000;
+    try {
+        if (elapsedSeconds <= trace.thresholdSeconds) {
+            return false;
+        }
+        const files = external_fs_namespaceObject.readdirSync(trace.directory)
+            .filter(file => external_fs_namespaceObject.statSync(external_path_namespaceObject.join(trace.directory, file)).isFile());
+        if (files.length === 0) {
+            warning(`Checkout took ${elapsedSeconds.toFixed(0)}s but no git trace files were written`);
+            return false;
+        }
+        external_fs_namespaceObject.mkdirSync(destination, { recursive: true });
+        const redact = redactor(secrets);
+        for (const file of files) {
+            await copyRedacted(external_path_namespaceObject.join(trace.directory, file), external_path_namespaceObject.join(destination, file), redact);
+        }
+        warning(`Checkout took ${elapsedSeconds.toFixed(0)}s (threshold ${trace.thresholdSeconds}s); git traces written to ${destination}`);
+        return true;
+    }
+    catch (error) {
+        warning(`Failed to save git traces: ${error instanceof Error ? error.message : error}`);
+        return false;
+    }
+    finally {
+        try {
+            external_fs_namespaceObject.rmSync(trace.directory, { recursive: true, force: true });
+        }
+        catch (error) {
+            warning(`Failed to remove ${trace.directory}: ${error instanceof Error ? error.message : error}`);
+        }
+    }
+}
+function publish(output, summary) {
+    try {
+        external_fs_namespaceObject.writeFileSync(external_path_namespaceObject.join(output.directory, ATTEMPTS_FILE), `${JSON.stringify(summary, null, 2)}\n`);
+        exportVariable(DIRECTORY_VARIABLE, output.directory);
+        exportVariable(ARTIFACT_VARIABLE, artifactName(output.id));
+    }
+    catch (error) {
+        warning(`Failed to export git traces: ${error instanceof Error ? error.message : error}`);
+    }
+}
+
+;// CONCATENATED MODULE: ./src/warpbuild/attempts.ts
+/* eslint-disable i18n-text/no-en, import/no-unresolved -- upstream conventions; no TS import resolver configured */
+
+
+
+
+// Runs each checkout attempt in a child process so a hung git command can be
+// killed, together with everything it spawned, once the attempt times out.
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_TIMEOUT_MINUTES = 10;
+const RETRY_MIN_SECONDS = 10;
+const RETRY_MAX_SECONDS = 20;
+const ATTEMPT_VARIABLE = 'WARPBUILD_CHECKOUT_ATTEMPT';
+function parseInput(name, defaultValue, isValid, expected) {
+    const input = getInput(name);
+    if (!input) {
+        return defaultValue;
+    }
+    const value = Number(input);
+    if (!isValid(value)) {
+        throw new Error(`Invalid ${name} '${input}'. Expected ${expected}.`);
+    }
+    return value;
+}
+function getSettings() {
+    return {
+        maxAttempts: parseInput('max-attempts', DEFAULT_MAX_ATTEMPTS, value => Number.isInteger(value) && value >= 1, 'a positive integer'),
+        timeoutMinutes: parseInput('attempt-timeout-minutes', DEFAULT_TIMEOUT_MINUTES, value => Number.isFinite(value) && value >= 0, 'a non-negative number')
+    };
+}
+function childAttempt() {
+    const match = /^(\d+)\/(\d+)$/.exec(process.env[ATTEMPT_VARIABLE] || '');
+    if (!match) {
+        return undefined;
+    }
+    return { attempt: Number(match[1]), maxAttempts: Number(match[2]) };
+}
+function killTree(child) {
+    if (child.pid === undefined) {
+        return;
+    }
+    try {
+        if (process.platform === 'win32') {
+            (0,external_child_process_namespaceObject.spawnSync)('taskkill', ['/pid', String(child.pid), '/T', '/F']);
+        }
+        else {
+            process.kill(-child.pid, 'SIGKILL');
+        }
+    }
+    catch (error) {
+        warning(`Failed to kill checkout attempt: ${error instanceof Error ? error.message : error}`);
+    }
+}
+async function runChild(command, env, timeoutMs) {
+    return new Promise(resolve => {
+        const child = (0,external_child_process_namespaceObject.spawn)(command[0], command.slice(1), {
+            env,
+            stdio: 'inherit',
+            detached: process.platform !== 'win32'
+        });
+        let timedOut = false;
+        const timer = timeoutMs > 0
+            ? setTimeout(() => {
+                timedOut = true;
+                killTree(child);
+            }, timeoutMs)
+            : undefined;
+        const forward = () => {
+            killTree(child);
+            process.exit(1);
+        };
+        process.once('SIGINT', forward);
+        process.once('SIGTERM', forward);
+        const settle = (outcome) => {
+            clearTimeout(timer);
+            process.removeListener('SIGINT', forward);
+            process.removeListener('SIGTERM', forward);
+            resolve(timedOut ? 'timeout' : outcome);
+        };
+        child.once('error', error => {
+            warning(`Failed to start checkout attempt: ${error.message}`);
+            settle('failure');
+        });
+        child.once('exit', code => settle(code === 0 ? 'success' : 'failure'));
+    });
+}
+async function sleepSeconds(seconds) {
+    return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+}
+async function run(settings, options) {
+    const now = options.now ?? Date.now;
+    const sleep = options.sleep ?? sleepSeconds;
+    clearExports();
+    const output = newOutput();
+    const results = [];
+    for (let attempt = 1; attempt <= settings.maxAttempts; attempt++) {
+        const trace = start(options.thresholdSeconds, now);
+        const startedAt = now();
+        const outcome = await runChild(options.command, {
+            ...process.env,
+            [ATTEMPT_VARIABLE]: `${attempt}/${settings.maxAttempts}`
+        }, settings.timeoutMinutes * 60_000);
+        const durationSeconds = Math.round((now() - startedAt) / 1000);
+        const traced = output !== undefined &&
+            (await finish(trace, options.secrets, external_path_namespaceObject.join(output.directory, `attempt-${attempt}`), now));
+        results.push({ attempt, outcome, duration_seconds: durationSeconds, traced });
+        if (outcome === 'success') {
+            break;
+        }
+        const reason = outcome === 'timeout'
+            ? `timed out after ${settings.timeoutMinutes} minutes`
+            : 'failed';
+        if (attempt === settings.maxAttempts) {
+            setFailed(`Checkout attempt ${attempt}/${settings.maxAttempts} ${reason}; giving up`);
+            break;
+        }
+        const seconds = Math.floor(Math.random() * (RETRY_MAX_SECONDS - RETRY_MIN_SECONDS + 1)) +
+            RETRY_MIN_SECONDS;
+        warning(`Checkout attempt ${attempt}/${settings.maxAttempts} ${reason}; retrying in ${seconds} seconds`);
+        await sleep(seconds);
+    }
+    if (output !== undefined && results.some(result => result.traced)) {
+        publish(output, {
+            max_attempts: settings.maxAttempts,
+            attempt_timeout_minutes: settings.timeoutMinutes,
+            threshold_seconds: options.thresholdSeconds,
+            attempts: results
+        });
+    }
+    return results;
+}
+
 ;// CONCATENATED MODULE: ./src/fs-helper.ts
 
 function directoryExistsSync(path, required) {
@@ -42010,8 +42298,6 @@ function ref_helper_select(obj, path) {
     return ref_helper_select(obj[key], path.substr(i + 1));
 }
 
-;// CONCATENATED MODULE: external "stream/promises"
-const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("stream/promises");
 ;// CONCATENATED MODULE: ./src/warpbuild/backend-api.ts
 /* eslint-disable i18n-text/no-en -- upstream convention */
 
@@ -43131,140 +43417,6 @@ async function getGitCommandManager(settings) {
     }
 }
 
-;// CONCATENATED MODULE: external "readline"
-const external_readline_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("readline");
-;// CONCATENATED MODULE: ./src/warpbuild/git-trace.ts
-/* eslint-disable i18n-text/no-en -- upstream conventions */
-
-
-
-
-
-
-// Native git tracing for every checkout. When the whole checkout exceeds the
-// threshold, the redacted traces are moved to OUTPUT_DIRECTORY under
-// RUNNER_TEMP and exported through the CHECKOUT_GIT_TRACE_* environment
-// variables so a later workflow step can upload them.
-const DEFAULT_THRESHOLD_SECONDS = 180;
-const OUTPUT_DIRECTORY = 'checkout-git-traces';
-const DIRECTORY_VARIABLE = 'CHECKOUT_GIT_TRACE_DIR';
-const ARTIFACT_VARIABLE = 'CHECKOUT_GIT_TRACE_ARTIFACT';
-const TRACE_FILES = {
-    GIT_TRACE: 'trace.log',
-    GIT_TRACE_PACKET: 'trace-packet.log',
-    GIT_TRACE_CURL: 'trace-curl.log',
-    GIT_TRACE2_PERF: 'trace2-perf.log',
-    GIT_TRACE2_EVENT: 'trace2-event.json'
-};
-function getThresholdSeconds() {
-    const input = getInput('git-trace-threshold-seconds');
-    if (!input) {
-        return DEFAULT_THRESHOLD_SECONDS;
-    }
-    const value = Number(input);
-    if (!Number.isFinite(value) || value < 0) {
-        throw new Error(`Invalid git-trace-threshold-seconds '${input}'. Expected a non-negative number.`);
-    }
-    return value;
-}
-function start(thresholdSeconds, now = Date.now) {
-    // Only describe the most recent checkout, so an upload step after a fast
-    // or untraced checkout does not re-upload an earlier checkout's traces.
-    if (process.env[ARTIFACT_VARIABLE]) {
-        exportVariable(ARTIFACT_VARIABLE, '');
-        exportVariable(DIRECTORY_VARIABLE, '');
-    }
-    const runnerTemp = process.env['RUNNER_TEMP'];
-    if (thresholdSeconds <= 0 || !runnerTemp) {
-        return undefined;
-    }
-    const directory = external_path_namespaceObject.join(runnerTemp, `checkout-git-trace-${external_crypto_namespaceObject.randomUUID()}`);
-    external_fs_namespaceObject.mkdirSync(directory, { recursive: true });
-    const setVariables = [];
-    const setIfUnset = (name, value) => {
-        if (process.env[name] === undefined) {
-            process.env[name] = value;
-            setVariables.push(name);
-        }
-    };
-    for (const [name, file] of Object.entries(TRACE_FILES)) {
-        setIfUnset(name, external_path_namespaceObject.join(directory, file));
-    }
-    setIfUnset('GIT_TRACE_CURL_NO_DATA', '1');
-    return { directory, thresholdSeconds, startedAt: now(), setVariables };
-}
-function artifactName(id) {
-    const job = (process.env['GITHUB_JOB'] || 'job').replace(/[^A-Za-z0-9_.-]/g, '-');
-    const attempt = process.env['GITHUB_RUN_ATTEMPT'] || '1';
-    return `checkout-git-trace-${job}-attempt-${attempt}-${id}`;
-}
-function redactor(secrets) {
-    const values = secrets
-        .filter(secret => secret.length >= 4)
-        .flatMap(secret => [
-        secret,
-        Buffer.from(`x-access-token:${secret}`, 'utf8').toString('base64')
-    ]);
-    return line => {
-        let result = line.replace(/(:\/\/[^/\s:@]+:)[^@\s/]+@/g, '$1***@');
-        for (const value of values) {
-            result = result.split(value).join('***');
-        }
-        return result;
-    };
-}
-async function copyRedacted(source, destination, redact) {
-    await (0,promises_namespaceObject.pipeline)(external_readline_namespaceObject.createInterface({
-        input: external_fs_namespaceObject.createReadStream(source),
-        crlfDelay: Infinity
-    }), async function* (lines) {
-        for await (const line of lines) {
-            yield `${redact(line)}\n`;
-        }
-    }, external_fs_namespaceObject.createWriteStream(destination));
-}
-async function finish(trace, secrets, now = Date.now) {
-    if (!trace) {
-        return;
-    }
-    for (const name of trace.setVariables) {
-        delete process.env[name];
-    }
-    const elapsedSeconds = (now() - trace.startedAt) / 1000;
-    try {
-        if (elapsedSeconds <= trace.thresholdSeconds) {
-            return;
-        }
-        const files = external_fs_namespaceObject.readdirSync(trace.directory)
-            .filter(file => external_fs_namespaceObject.statSync(external_path_namespaceObject.join(trace.directory, file)).isFile());
-        if (files.length === 0) {
-            warning(`Checkout took ${elapsedSeconds.toFixed(0)}s but no git trace files were written`);
-            return;
-        }
-        const id = external_crypto_namespaceObject.randomUUID().slice(0, 8);
-        const outputDirectory = external_path_namespaceObject.join(external_path_namespaceObject.dirname(trace.directory), OUTPUT_DIRECTORY, id);
-        external_fs_namespaceObject.mkdirSync(outputDirectory, { recursive: true });
-        const redact = redactor(secrets);
-        for (const file of files) {
-            await copyRedacted(external_path_namespaceObject.join(trace.directory, file), external_path_namespaceObject.join(outputDirectory, file), redact);
-        }
-        exportVariable(DIRECTORY_VARIABLE, outputDirectory);
-        exportVariable(ARTIFACT_VARIABLE, artifactName(id));
-        warning(`Checkout took ${elapsedSeconds.toFixed(0)}s (threshold ${trace.thresholdSeconds}s); git traces written to ${outputDirectory}`);
-    }
-    catch (error) {
-        warning(`Failed to save git traces: ${error instanceof Error ? error.message : error}`);
-    }
-    finally {
-        try {
-            external_fs_namespaceObject.rmSync(trace.directory, { recursive: true, force: true });
-        }
-        catch (error) {
-            warning(`Failed to remove ${trace.directory}: ${error instanceof Error ? error.message : error}`);
-        }
-    }
-}
-
 ;// CONCATENATED MODULE: ./src/unsafe-pr-checkout-helper.ts
 
 
@@ -43533,11 +43685,23 @@ async function getInputs() {
 
 
 
+
 const main_dirname = external_path_namespaceObject.dirname((0,external_url_namespaceObject.fileURLToPath)(import.meta.url));
-async function run() {
+async function main_run() {
+    try {
+        await run(getSettings(), {
+            command: [process.execPath, ...process.argv.slice(1)],
+            thresholdSeconds: getThresholdSeconds(),
+            secrets: [getInput('token')]
+        });
+    }
+    catch (error) {
+        setFailed(`${error?.message ?? error}`);
+    }
+}
+async function runAttempt(attempt) {
     try {
         const sourceSettings = await getInputs();
-        const trace = start(getThresholdSeconds());
         try {
             // Register problem matcher
             info(`::add-matcher::${external_path_namespaceObject.join(main_dirname, 'problem-matcher.json')}`);
@@ -43548,11 +43712,17 @@ async function run() {
         finally {
             // Unregister problem matcher
             info('::remove-matcher owner=checkout-git::');
-            await finish(trace, [sourceSettings.authToken]);
         }
     }
     catch (error) {
-        setFailed(`${error?.message ?? error}`);
+        const message = `${error?.message ?? error}`;
+        if (attempt.attempt < attempt.maxAttempts) {
+            warning(message);
+            process.exitCode = 1;
+        }
+        else {
+            setFailed(message);
+        }
     }
 }
 async function main_cleanup() {
@@ -43564,11 +43734,15 @@ async function main_cleanup() {
     }
 }
 // Main
-if (!IsPost) {
-    run();
-}
-// Post
-else {
+const main_childAttempt = childAttempt();
+if (IsPost) {
     main_cleanup();
+}
+else if (main_childAttempt) {
+    runAttempt(main_childAttempt);
+}
+// Parent
+else {
+    main_run();
 }
 
