@@ -1,4 +1,5 @@
 import * as core from '@actions/core'
+import * as attempts from './warpbuild/attempts.js'
 import * as gitSourceProvider from './git-source-provider.js'
 import * as gitTrace from './warpbuild/git-trace.js'
 import * as inputHelper from './input-helper.js'
@@ -10,8 +11,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 async function run(): Promise<void> {
   try {
+    await attempts.run(attempts.getSettings(), {
+      command: [process.execPath, ...process.argv.slice(1)],
+      thresholdSeconds: gitTrace.getThresholdSeconds(),
+      secrets: [core.getInput('token')]
+    })
+  } catch (error) {
+    core.setFailed(`${(error as any)?.message ?? error}`)
+  }
+}
+
+async function runAttempt(attempt: attempts.ChildAttempt): Promise<void> {
+  try {
     const sourceSettings = await inputHelper.getInputs()
-    const trace = gitTrace.start(gitTrace.getThresholdSeconds())
 
     try {
       // Register problem matcher
@@ -25,10 +37,15 @@ async function run(): Promise<void> {
     } finally {
       // Unregister problem matcher
       core.info('::remove-matcher owner=checkout-git::')
-      await gitTrace.finish(trace, [sourceSettings.authToken])
     }
   } catch (error) {
-    core.setFailed(`${(error as any)?.message ?? error}`)
+    const message = `${(error as any)?.message ?? error}`
+    if (attempt.attempt < attempt.maxAttempts) {
+      core.warning(message)
+      process.exitCode = 1
+    } else {
+      core.setFailed(message)
+    }
   }
 }
 
@@ -41,10 +58,13 @@ async function cleanup(): Promise<void> {
 }
 
 // Main
-if (!stateHelper.IsPost) {
-  run()
-}
-// Post
-else {
+const childAttempt = attempts.childAttempt()
+if (stateHelper.IsPost) {
   cleanup()
+} else if (childAttempt) {
+  runAttempt(childAttempt)
+}
+// Parent
+else {
+  run()
 }

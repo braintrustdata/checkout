@@ -83,6 +83,16 @@ inputs:
       location in CHECKOUT_GIT_TRACE_DIR and an artifact name in
       CHECKOUT_GIT_TRACE_ARTIFACT. Set to 0 to disable tracing.
     default: 180
+  attempt-timeout-minutes:
+    description: >
+      Kill a checkout attempt, including the git commands it started, after this
+      many minutes. Set to 0 to disable the timeout.
+    default: 10
+  max-attempts:
+    description: >
+      Total number of checkout attempts. A failed or timed out attempt is retried
+      after 10 to 20 seconds until this many attempts have run.
+    default: 3
   fetch-depth:
     description: 'Number of commits to fetch. 0 indicates all history for all branches and tags.'
     default: 1

@@ -20,12 +20,19 @@ checkout shape:
   the checkout was seeded from the mirror). Behavior is identical to upstream everywhere
   except WarpBuild runners.
 - Fail-open — any cache error degrades to stock `actions/checkout` behavior.
+- Runs each checkout attempt in a child process. An attempt that runs longer than
+  `attempt-timeout-minutes` (default `10`; `0` disables) is killed with every git process it
+  started. Failed and timed out attempts are retried after 10 to 20 seconds, up to
+  `max-attempts` attempts in total (default `3`).
 - Traces git (`GIT_TRACE`, `GIT_TRACE_PACKET`, `GIT_TRACE_CURL` without data, `GIT_TRACE2_PERF`,
-  `GIT_TRACE2_EVENT`) to files under `RUNNER_TEMP`. When the checkout takes longer than
-  `git-trace-threshold-seconds` (default `180`; `0` disables), the traces are redacted, moved to
-  `$RUNNER_TEMP/checkout-git-traces/<id>`, and exported as `CHECKOUT_GIT_TRACE_DIR` with a
-  unique artifact name in `CHECKOUT_GIT_TRACE_ARTIFACT`; otherwise they are deleted. Trace
-  variables already set by the workflow are left alone, and tracing errors only warn.
+  `GIT_TRACE2_EVENT`) to files under `RUNNER_TEMP`, separately for each attempt. When an attempt
+  takes longer than `git-trace-threshold-seconds` (default `180`; `0` disables), its traces are
+  redacted and moved to `$RUNNER_TEMP/checkout-git-traces/<id>/attempt-<n>`; otherwise they are
+  deleted. When any attempt was slow, `attempts.json` in that directory lists every attempt's
+  outcome (`success`, `failure` or `timeout`), duration and whether it was traced, and the
+  directory is exported as `CHECKOUT_GIT_TRACE_DIR` with a unique artifact name in
+  `CHECKOUT_GIT_TRACE_ARTIFACT`. Trace variables already set by the workflow are left alone, and
+  tracing errors only warn.
 - All fork code lives in `src/warpbuild/`.
 
 ## Upload traces from slow checkouts
@@ -199,6 +206,16 @@ Please refer to the [release page](https://github.com/WarpBuilds/checkout/releas
     # to 0 to disable tracing.
     # Default: 180
     git-trace-threshold-seconds: ''
+
+    # Kill a checkout attempt, including the git commands it started, after this many
+    # minutes. Set to 0 to disable the timeout.
+    # Default: 10
+    attempt-timeout-minutes: ''
+
+    # Total number of checkout attempts. A failed or timed out attempt is retried
+    # after 10 to 20 seconds until this many attempts have run.
+    # Default: 3
+    max-attempts: ''
 
     # Number of commits to fetch. 0 indicates all history for all branches and tags.
     # Default: 1
