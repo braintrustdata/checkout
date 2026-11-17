@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import {
   ATTEMPT_VARIABLE,
   childAttempt,
+  credentialFiles,
   getSettings,
   run
 } from '../src/warpbuild/attempts.js'
@@ -19,6 +20,7 @@ const managedVariables = [
   'GITHUB_JOB',
   'GITHUB_RUN_ATTEMPT',
   'GITHUB_ENV',
+  'GITHUB_STATE',
   ATTEMPT_VARIABLE,
   ARTIFACT_VARIABLE,
   DIRECTORY_VARIABLE,
@@ -68,6 +70,33 @@ describe('attempts', () => {
     process.env['INPUT_MAX-ATTEMPTS'] = '1'
     process.env['INPUT_ATTEMPT-TIMEOUT-MINUTES'] = '-1'
     expect(() => getSettings()).toThrow(/attempt-timeout-minutes/)
+  })
+
+  it('reads credential files from the saved state', () => {
+    expect(
+      credentialFiles(
+        'repositoryPath<<d1\n/w\nd1\nsshKeyPath<<d2\n/t/key\nd2\nsshKnownHostsPath<<d3\r\n/t/key_known_hosts\r\nd3\r\nsshKeyPath<<d4\n\nd4\n'
+      )
+    ).toEqual(['/t/key', '/t/key_known_hosts'])
+  })
+
+  it('removes the credential files of a timed out attempt', async () => {
+    const statePath = path.join(runnerTemp, 'github-state')
+    const keyPath = path.join(runnerTemp, 'key')
+    process.env['GITHUB_STATE'] = statePath
+    fs.writeFileSync(statePath, '')
+    const script = `
+      const fs = require('fs')
+      fs.writeFileSync(${JSON.stringify(keyPath)}, 'secret')
+      fs.appendFileSync(${JSON.stringify(statePath)}, 'sshKeyPath<<d\\n${keyPath}\\nd\\n')
+      setInterval(() => {}, 1000)
+    `
+    const results = await run(
+      {maxAttempts: 1, timeoutMinutes: 0.01},
+      {command: node(script), thresholdSeconds: 0, secrets: [], sleep: noSleep}
+    )
+    expect(results.map(result => result.outcome)).toEqual(['timeout'])
+    expect(fs.existsSync(keyPath)).toBe(false)
   })
 
   it('reads the attempt of a child process', () => {

@@ -1,5 +1,6 @@
 /* eslint-disable i18n-text/no-en, import/no-unresolved -- upstream conventions; no TS import resolver configured */
 import * as core from '@actions/core'
+import * as fs from 'fs'
 import * as gitTrace from './git-trace.js'
 import * as path from 'path'
 import {ChildProcess, spawn, spawnSync} from 'child_process'
@@ -12,6 +13,7 @@ const DEFAULT_TIMEOUT_MINUTES = 10
 const RETRY_MIN_SECONDS = 10
 const RETRY_MAX_SECONDS = 20
 export const ATTEMPT_VARIABLE = 'WARPBUILD_CHECKOUT_ATTEMPT'
+const CREDENTIAL_FILE_STATES = ['sshKeyPath', 'sshKnownHostsPath']
 
 export type AttemptOutcome = 'success' | 'failure' | 'timeout'
 
@@ -138,6 +140,38 @@ export async function runChild(
   })
 }
 
+export function credentialFiles(state: string): string[] {
+  const files: string[] = []
+  for (const match of state.matchAll(
+    /^([^\r\n]+?)<<(\S+)\r?\n([\s\S]*?)\r?\n\2\r?$/gm
+  )) {
+    if (CREDENTIAL_FILE_STATES.includes(match[1]) && match[3]) {
+      files.push(match[3])
+    }
+  }
+  return files
+}
+
+// A killed attempt cannot remove the SSH key it wrote, and the post step only
+// removes the key of the last attempt.
+async function removeCredentialFiles(): Promise<void> {
+  const statePath = process.env['GITHUB_STATE']
+  if (!statePath) {
+    return
+  }
+  let state: string
+  try {
+    state = await fs.promises.readFile(statePath, 'utf8')
+  } catch {
+    return
+  }
+  await Promise.all(
+    credentialFiles(state).map(async file =>
+      fs.promises.rm(file, {force: true})
+    )
+  )
+}
+
 async function sleepSeconds(seconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, seconds * 1000))
 }
@@ -163,6 +197,9 @@ export async function run(
       settings.timeoutMinutes * 60_000
     )
     const durationSeconds = Math.round((now() - startedAt) / 1000)
+    if (outcome !== 'success') {
+      await removeCredentialFiles()
+    }
     const traced =
       output !== undefined &&
       (await gitTrace.finish(

@@ -35315,6 +35315,7 @@ function publish(output, summary) {
 
 
 
+
 // Runs each checkout attempt in a child process so a hung git command can be
 // killed, together with everything it spawned, once the attempt times out.
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -35322,6 +35323,7 @@ const DEFAULT_TIMEOUT_MINUTES = 10;
 const RETRY_MIN_SECONDS = 10;
 const RETRY_MAX_SECONDS = 20;
 const ATTEMPT_VARIABLE = 'WARPBUILD_CHECKOUT_ATTEMPT';
+const CREDENTIAL_FILE_STATES = ['sshKeyPath', 'sshKnownHostsPath'];
 function parseInput(name, defaultValue, isValid, expected) {
     const input = getInput(name);
     if (!input) {
@@ -35395,6 +35397,31 @@ async function runChild(command, env, timeoutMs) {
         child.once('exit', code => settle(code === 0 ? 'success' : 'failure'));
     });
 }
+function credentialFiles(state) {
+    const files = [];
+    for (const match of state.matchAll(/^([^\r\n]+?)<<(\S+)\r?\n([\s\S]*?)\r?\n\2\r?$/gm)) {
+        if (CREDENTIAL_FILE_STATES.includes(match[1]) && match[3]) {
+            files.push(match[3]);
+        }
+    }
+    return files;
+}
+// A killed attempt cannot remove the SSH key it wrote, and the post step only
+// removes the key of the last attempt.
+async function removeCredentialFiles() {
+    const statePath = process.env['GITHUB_STATE'];
+    if (!statePath) {
+        return;
+    }
+    let state;
+    try {
+        state = await external_fs_namespaceObject.promises.readFile(statePath, 'utf8');
+    }
+    catch {
+        return;
+    }
+    await Promise.all(credentialFiles(state).map(async (file) => external_fs_namespaceObject.promises.rm(file, { force: true })));
+}
 async function sleepSeconds(seconds) {
     return new Promise(resolve => setTimeout(resolve, seconds * 1000));
 }
@@ -35412,6 +35439,9 @@ async function run(settings, options) {
             [ATTEMPT_VARIABLE]: `${attempt}/${settings.maxAttempts}`
         }, settings.timeoutMinutes * 60_000);
         const durationSeconds = Math.round((now() - startedAt) / 1000);
+        if (outcome !== 'success') {
+            await removeCredentialFiles();
+        }
         const traced = output !== undefined &&
             (await finish(trace, options.secrets, external_path_namespaceObject.join(output.directory, `attempt-${attempt}`), now));
         results.push({ attempt, outcome, duration_seconds: durationSeconds, traced });
